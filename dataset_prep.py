@@ -6,11 +6,23 @@ from datasets import load_dataset
 os.makedirs("data", exist_ok=True)
 
 stsb = load_dataset("sentence-transformers/stsb", split="train")
-snli = load_dataset("snli", split="train").filter(lambda x: x["label"] != -1)
+snli = load_dataset("stanfordnlp/snli", split="train").filter(lambda x: x["label"] != -1)
 
-positives = [{"sentence1": row["sentence1"], "sentence2": row["sentence2"]} for row in stsb if row["score"] >= 4.0]
-negatives_easy = [{"sentence1": row["sentence1"], "sentence2": row["sentence2"]} for row in stsb if row["score"] <= 1.0]
+
+def thresholds(scores):
+    """sentence-transformers/stsb is normalised to [0, 1]; the original release uses [0, 5]."""
+    return (0.8, 0.2) if max(scores) <= 1.0 else (4.0, 1.0)
+
+
+POS_T, NEG_T = thresholds(stsb["score"])
+print(f"STS-B score scale max={max(stsb['score']):.2f} -> positive >= {POS_T}, easy negative <= {NEG_T}")
+
+positives = [{"sentence1": row["sentence1"], "sentence2": row["sentence2"]} for row in stsb if row["score"] >= POS_T]
+negatives_easy = [{"sentence1": row["sentence1"], "sentence2": row["sentence2"]} for row in stsb if row["score"] <= NEG_T]
 negatives_hard = [{"sentence1": row["premise"], "sentence2": row["hypothesis"]} for row in snli if row["label"] == 2]
+
+assert positives, "no positive pairs selected — check the score scale"
+assert negatives_easy, "no easy negatives selected — check the score scale"
 
 negatives_shuffled = []
 for pair in positives:
