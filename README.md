@@ -1,113 +1,196 @@
 # Energy-Based Semantic Landscapes: Controlling Output Stability in Language Model Generation
 
-## Overview
+Can a **learned energy function** make a small LLM give more consistent answers to the same question?
+This project trains an energy-based model (EBM) on semantic-similarity data, refines a draft answer's BERT embedding with Langevin dynamics, and re-ranks the LM's candidate outputs by closeness to the refined vector. The LM stays frozen.
 
-This project looks at the use of Energy-Based Models (EBMs) combined with Langevin dynamics in hopes to reduce output variance in LLM generation. Rather than using hand crafting constraints, we train a learned energy function on semantic similarity data and operate in BERT embedding space to guide generation toward more stable and semantically coherent outputs across repeated runs.
-
-The core idea is to refine a draft generation by performing gradient based optimization in the embedding space, penalizing both semantic incoherence (via the learned EBM) and drift from the original prompt (via a cosine similarity penalty). Candidates from the language model are then re-ranked by closeness to the refined vector.
-
+**Result in one line:** variance drops ~35%, but plain best-of-N re-ranking gets the same drop, so the EBM adds nothing measurable here (see [Results](#results)).
 
 ---
 
-## Method
+## Pipeline
 
-The pipeline is organized into six stations:
+```mermaid
+flowchart LR
+    subgraph DATA["Stations 1-2: Data"]
+        A["STS-B + SNLI"] --> B["Training triples<br/>anchor / positive / negative"]
+    end
+    subgraph TRAIN["Station 3: EBM"]
+        B --> C["Frozen BERT<br/>CLS embeddings"]
+        C --> D["EnergyMLP<br/>NCE + margin loss"]
+    end
+    subgraph DECODE["Stations 4-5: Decode"]
+        E["Prompt"] --> F["Draft from frozen LM"]
+        F --> G["Langevin refinement<br/>in BERT space"]
+        D -. energy .-> G
+        G --> H["Re-rank LM candidates<br/>by cosine to refined vector"]
+    end
+    subgraph EVAL["Station 6: Eval"]
+        H --> I["Semantic variance<br/>BERTScore F1"]
+    end
+```
 
-**Stations 1-2: Data Preparation**
+### Stations 1-2: Data preparation
 
-Training data is constructed from two sources:
-- Positive pairs: STS-B sentence pairs above a similarity threshold
-- Hard negatives: contradiction pairs from SNLI (label = 2)
-- Easy negatives: STS-B pairs below a low similarity threshold
-- Shuffled negatives: positive pairs with word order randomly permuted
+Each training example is a triple `(anchor, positive, negative)`. The positive is always a genuine paraphrase of the anchor, never the anchor itself (an identity positive makes `|anchor - positive| = 0` and the ranking task trivial).
 
-The thresholds are picked from the data: `sentence-transformers/stsb` normalises scores to `[0, 1]`, while
-the original STS-B release uses `[0, 5]`, so the code reads the scale and uses `>= 0.8 / <= 0.2` or
-`>= 4.0 / <= 1.0` accordingly. Three types of training triples are formed and saved to disk. In every
-triple the positive is a genuine paraphrase of the anchor, never the anchor itself — an identity positive
-makes `|anchor - positive| = 0` and the ranking task trivial.
+```mermaid
+flowchart TD
+    S["STS-B<br/>sentence-transformers/stsb"] --> SC{"Score scale?"}
+    SC -->|"max <= 1.0"| T1["pos >= 0.8<br/>neg <= 0.2"]
+    SC -->|"max > 1.0"| T2["pos >= 4.0<br/>neg <= 1.0"]
+    T1 --> P["Positives<br/>paraphrase pairs"]
+    T2 --> P
+    T1 --> EN["Easy negatives<br/>low-similarity pairs"]
+    T2 --> EN
+    P --> SH["Shuffled negatives<br/>word order permuted"]
+    N["SNLI contradictions<br/>label = 2"] --> HN["Hard negatives"]
+    P --> TA["Type A<br/>paraphrase + shuffled"]
+    SH --> TA
+    P --> TB["Type B<br/>paraphrase + SNLI contradiction"]
+    HN --> TB
+    P --> TC["Type C<br/>paraphrase + easy negative"]
+    EN --> TC
+    TA --> SPLIT["90% train / 10% held out"]
+    TB --> SPLIT
+    TC --> SPLIT
+```
 
-**Station 3: Energy Model Training**
+### Station 3: Energy model
 
-A two-layer MLP (EnergyMLP) is trained on top of frozen BERT CLS embeddings. The input is the absolute difference between anchor and candidate vectors (768-dimensional). Training uses Noise Contrastive Estimation with MarginRankingLoss (margin=1.0) and an Adam optimizer (lr=2e-4) over 5 epochs. The goal is to assign lower energy to semantically coherent pairs and higher energy to incoherent ones. 10% of the triples are held out, and the notebook reports ranking accuracy (the fraction of unseen triples where the positive scores lower than the negative) alongside the loss curve.
+A two-layer MLP (`EnergyMLP`, 197,121 params) scores `|anchor - candidate|` (768-d, from frozen `bert-base-uncased` CLS embeddings). Trained with noise-contrastive estimation and `MarginRankingLoss` so that coherent pairs get **lower** energy than incoherent ones. The held-out split reports ranking accuracy alongside the loss curve.
 
-**Stations 4-5: Langevin Decoding with Drift Penalty**
+```mermaid
+flowchart LR
+    A["anchor"] --> BA["BERT CLS"]
+    P["positive"] --> BP["BERT CLS"]
+    N["negative"] --> BN["BERT CLS"]
+    BA --> DP["abs diff"]
+    BP --> DP
+    BA --> DN["abs diff"]
+    BN --> DN
+    DP --> EP["EnergyMLP"] --> EPV["E positive"]
+    DN --> EN["EnergyMLP<br/>shared weights"] --> ENV["E negative"]
+    EPV --> L["MarginRankingLoss<br/>want E pos + margin < E neg"]
+    ENV --> L
+```
 
-Given a prompt:
-1. Encode the prompt with BERT to obtain a reference embedding.
-2. Sample an initial draft from the language model and encode it.
-3. Run Langevin refinement for `n_steps` iterations:
-   - Compute total energy = EBM energy + alpha * (1 - cosine_similarity to prompt)
-   - Update the embedding via gradient descent plus Gaussian noise.
-4. Generate `n_candidates` outputs from the language model and re-rank them by cosine similarity to the refined embedding.
+### Stations 4-5: Langevin decoding with drift penalty
 
-The language model (Phi-3-mini-4k-instruct, with TinyLlama-1.1B-Chat as fallback) is kept fully frozen throughout.
+```mermaid
+sequenceDiagram
+    participant U as Prompt
+    participant LM as Frozen LM
+    participant B as BERT
+    participant L as Langevin loop
+    participant R as Re-ranker
+    U->>B: encode prompt (reference vector)
+    U->>LM: sample draft
+    LM->>B: encode draft (start vector)
+    B->>L: start vector
+    loop n_steps
+        Note over L: E_total = EBM energy + alpha * (1 - cos to prompt)
+        L->>L: gradient step + Gaussian noise
+    end
+    U->>LM: sample n_candidates
+    LM->>R: candidate texts
+    L->>R: refined vector
+    R->>R: rank candidates by cosine to refined vector
+    R-->>U: best candidate
+```
 
-**Station 6: Evaluation**
+### Station 6: Evaluation
 
-Ten semantic prompts are each run five times under three conditions: baseline (raw LM sampling), rerank-only
-(the same candidate pool ranked against the unrefined draft embedding — no EBM, no Langevin) and EBM-guided.
-The rerank-only arm is the ablation that separates the EBM's contribution from plain best-of-N re-ranking.
-Metrics:
-- Semantic variance: 1 - mean pairwise cosine similarity across outputs (lower is more consistent)
-- BERTScore F1: similarity between outputs and the prompt (higher is more relevant)
+10 prompts x 5 runs under three arms. The rerank-only arm isolates the EBM's contribution from plain best-of-N re-ranking.
+
+```mermaid
+flowchart LR
+    PR["10 prompts x 5 runs"] --> A1["Baseline<br/>raw LM sampling"]
+    PR --> A2["Rerank-only<br/>candidates ranked vs unrefined draft"]
+    PR --> A3["EBM-guided<br/>Langevin + rerank"]
+    A1 --> M["Semantic variance<br/>1 - mean pairwise cosine, lower is better"]
+    A2 --> M
+    A3 --> M
+    A1 --> BS["BERTScore F1 vs prompt<br/>higher is better"]
+    A2 --> BS
+    A3 --> BS
+    A3 -. "EBM share = EBM minus rerank-only" .-> A2
+```
+
+---
+
+## Results
+
+Latest notebook run: scale-aware STS-B threshold, non-identical positives, 10% held out. The language model was the **TinyLlama-1.1B-Chat fallback** (Phi-3-mini failed to load).
+
+**Data:** 1,406 STS-B positives, 1,103 easy negatives, 3,000 SNLI contradictions -> 3,915 triples (3,523 train / 392 held out).
+
+**EBM training:** loss 0.35 -> 0.13 over 5 epochs. Held-out ranking accuracy **365/392 = 93.1%**, mean energy margin (neg - pos) 2.25.
+
+| System | Mean semantic variance | Reduction vs baseline | BERTScore F1 |
+|---|---|---|---|
+| Baseline (raw sampling) | 0.1458 | - | 0.8536 |
+| Rerank-only (no EBM) | 0.0941 | 35.5% | 0.8532 |
+| EBM (Langevin + rerank) | 0.0954 | 34.6% | 0.8534 |
+
+```mermaid
+xychart-beta
+    title "Mean semantic variance (lower = more consistent)"
+    x-axis ["Baseline", "Rerank-only", "EBM"]
+    y-axis "Variance" 0 --> 0.16
+    bar [0.1458, 0.0941, 0.0954]
+```
+
+**Takeaway:** the EBM pipeline cuts output variance by ~35% with no BERTScore loss, but plain best-of-N re-ranking gets the same reduction (EBM minus rerank-only = -0.9 pts; EBM wins on 5 of 10 prompts, loses on 5). The EBM scores well on its own ranking task, yet Langevin refinement adds no measurable stability beyond re-ranking. With 10 prompts x 5 runs and a single seed, differences this small are within noise.
 
 ---
 
 ## Comparison with COLD Decoding
 
-This work is directly inspired by COLD Decoding (Qin et al., NeurIPS 2022) but differs in several key ways:
+Inspired by COLD Decoding (Qin et al., NeurIPS 2022). Both freeze the LM, apply Langevin dynamics in a continuous space, and inject noise during optimization.
 
-| Aspect | COLD Decoding | This Work |
+| Aspect | COLD Decoding | This work |
 |---|---|---|
 | Energy function | Hand-crafted constraints | Learned MLP trained on STS-B + SNLI |
-| Optimization space | Token logit space | BERT embedding space (768d) |
-| Decoding method | Soft tokens projected to vocabulary | Re-ranking from LM candidate pool | 
+| Optimization space | Token logit space | BERT embedding space (768-d) |
+| Decoding method | Soft tokens projected to vocabulary | Re-ranking from LM candidate pool |
 | Drift control | LM log-probability | Cosine similarity to prompt embedding |
 | Primary objective | Constraint satisfaction | Output variance reduction |
 | Training required | No | Yes (NCE on semantic similarity data) |
 
-Both methods freeze the language model, apply Langevin dynamics in a continuous space, and inject stochastic noise during optimization.
-
 ---
 
-## Repository Structure
+## Repository structure
 
-```
-.
-├── dataset_prep.py                        # Standalone script for building data files
-├── ebm_stability/
-│   └── ebm_stability_pipeline-final.ipynb       # Full end-to-end pipeline notebook
-├── data/
-│   ├── positives.json
-│   ├── negatives_easy.json
-│   ├── negatives_hard.json
-│   └── negatives_shuffled.json
-├── checkpoints/                           # Created at runtime
-│   └── energy_mlp.pt
-└── results/                               # Created at runtime
-    ├── variance_table.csv
-    ├── variance_comparison.png
-    └── training_loss.png
+```mermaid
+flowchart LR
+    ROOT["repo"] --> DP["dataset_prep.py<br/>builds data files"]
+    ROOT --> NB["ebm_stability/<br/>ebm_stability_pipeline-final.ipynb"]
+    ROOT --> DATA["data/"]
+    ROOT --> CK["checkpoints/<br/>created at runtime"]
+    ROOT --> RES["results/<br/>created at runtime"]
+    DATA --> D1["positives.json"]
+    DATA --> D2["negatives_easy.json"]
+    DATA --> D3["negatives_hard.json"]
+    DATA --> D4["negatives_shuffled.json"]
+    CK --> C1["energy_mlp.pt"]
+    RES --> R1["variance_table.csv"]
+    RES --> R2["variance_comparison.png"]
+    RES --> R3["training_loss.png"]
 ```
 
 ---
 
-## Setup and Usage
-
-**Install dependencies:**
+## Setup and usage
 
 ```bash
 pip install transformers datasets torch scikit-learn bert-score tqdm numpy pandas matplotlib accelerate bitsandbytes
 ```
 
-**Run the pipeline:**
+Open `ebm_stability/ebm_stability_pipeline-final.ipynb` and run cells in order. It handles data loading, EBM training, Langevin decoding, and evaluation end to end. To skip retraining, load `checkpoints/energy_mlp.pt` before the evaluation cells.
 
-Open `ebm_stability/ebm_stability_pipeline-final.ipynb` and run cells sequentially. The notebook handles dataset loading, model training, Langevin decoding, and evaluation end-to-end.
+**Hardware:** a CUDA GPU is recommended. The LM is loaded in 4-bit (bitsandbytes) when available; CPU works but is much slower.
 
-To skip retraining, load a saved checkpoint from `checkpoints/energy_mlp.pt` before running the evaluation cells.
-
-**Hardware:** A CUDA-compatible GPU is recommended. 4-bit quantization (via bitsandbytes) is used for the language model when available. CPU fallback is supported but will be significantly slower.
+**Reproducibility:** global seed 42 for Python, NumPy, and PyTorch.
 
 ---
 
@@ -119,45 +202,15 @@ To skip retraining, load a saved checkpoint from `checkpoints/energy_mlp.pt` bef
 | `alpha` | 0.5 | Weight of drift penalty relative to EBM energy |
 | `step_size` | 0.1 | Gradient step magnitude in Langevin update |
 | `noise_scale` | 0.01 | Gaussian noise injected per step |
-| `n_candidates` | 8 | Number of LM samples for re-ranking |
+| `n_candidates` | 8 | LM samples for re-ranking |
 | `temperature` | 0.9 | LM sampling temperature |
 | `NUM_EPOCHS` | 5 | EBM training epochs |
 | `margin` | 1.0 | MarginRankingLoss margin |
-| `learning_rate` | 2e-4 | Adam optimizer learning rate |
+| `learning_rate` | 2e-4 | Adam learning rate |
 | `batch_size` | 32 | Training batch size |
 
----
+## Models and datasets
 
-## Models and Datasets
-
-**Pre-trained models:**
-- BERT: `bert-base-uncased` (frozen encoder)
-- Language model: `microsoft/Phi-3-mini-4k-instruct` (fallback: `TinyLlama/TinyLlama-1.1B-Chat-v1.0`)
-
-**Datasets:**
-- STS-B: `sentence-transformers/stsb`
-- SNLI: `snli`
-
----
-
-## Results (latest notebook run)
-
-Fixed run (scale-aware STS-B threshold, non-identical positives, 10% held out, Phi-3-mini loaded).
-
-**Data:** 1406 STS-B positives, 1103 easy negatives, 3000 SNLI contradictions -> 3915 triples (3523 train / 392 held out).
-
-**EBM training:** loss 0.35 -> 0.13 over 5 epochs (no longer collapses to ~0). Held-out ranking accuracy **365/392 = 93.1%**, mean energy margin (neg - pos) 2.25.
-
-**Evaluation (10 prompts x 5 runs):**
-
-| System | Mean semantic variance | Reduction vs baseline | BERTScore F1 |
-|---|---|---|---|
-| Baseline (raw sampling) | 0.1458 | - | 0.8536 |
-| Rerank-only (no EBM) | 0.0941 | 35.5% | 0.8532 |
-| EBM (Langevin + rerank) | 0.0954 | 34.6% | 0.8534 |
-
-**Takeaway:** the EBM pipeline cuts output variance by ~35% with no BERTScore loss, but plain best-of-N re-ranking gets the same reduction (EBM minus rerank-only = -0.9 pts). The EBM scores well on its ranking task, yet Langevin refinement adds no measurable stability beyond re-ranking here. With 10 prompts x 5 runs and a single seed, differences this small are within noise.
-
-## Reproducibility
-
-A global seed of 42 is set for Python, NumPy, and PyTorch at the start of the pipeline.
+- **BERT:** `bert-base-uncased` (frozen encoder)
+- **LM:** `microsoft/Phi-3-mini-4k-instruct`, fallback `TinyLlama/TinyLlama-1.1B-Chat-v1.0` (used in the latest run)
+- **Data:** `sentence-transformers/stsb`, `stanfordnlp/snli`
